@@ -245,178 +245,11 @@ def load_weights_from_hf_model(model, hf_model) -> None:
     print("Weight loading complete!")
 
 
-def _load_weights_from_safetensors(model, model_dir: str) -> None:
-    """
-    Memory-efficient weight loading: reads safetensors shards one tensor
-    at a time instead of materializing the entire HF model in RAM.
-
-    Peak RAM: ~Triton model size + 1 tensor, instead of 3x model size.
-    """
-    import gc
-    import json
-    from pathlib import Path
-    from safetensors import safe_open
-
-    model_path = Path(model_dir)
-
-    # Determine which safetensors files to load
-    index_file = model_path / "model.safetensors.index.json"
-    if index_file.exists():
-        with open(index_file) as f:
-            index = json.load(f)
-        shard_files = sorted(set(index["weight_map"].values()))
-    else:
-        shard_files = ["model.safetensors"]
-
-    print(f"Loading weights from {len(shard_files)} shard(s)...")
-
-    total_params = 0
-    loaded = 0
-
-    for shard_name in shard_files:
-        shard_path = model_path / shard_name
-        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
-            keys = list(f.keys())
-            for key in keys:
-                tensor = f.get_tensor(key).to(torch.float32)
-                total_params += tensor.numel()
-                _assign_weight(model, key, tensor)
-                loaded += 1
-                if loaded % 50 == 0:
-                    print(f"  Loaded {loaded} params ({total_params / 1e6:.0f}M)...")
-                del tensor
-        gc.collect()
-
-    print(f"Loaded {loaded} tensors, {total_params / 1e6:.1f}M parameters total")
-
-
-def _assign_weight(model, key: str, tensor: torch.Tensor) -> None:
-    """Assign a single weight tensor to the correct location in the Triton model."""
-    # --- Audio encoder convolutions ---
-    if key == "audio_tower.conv1.weight":
-        load_conv1d_weight_from_hf(model.audio_encoder.conv1, tensor)
-        return
-    if key == "audio_tower.conv1.bias":
-        model.audio_encoder.conv1.bias = tensor.clone()
-        return
-    if key == "audio_tower.conv2.weight":
-        load_conv1d_weight_from_hf(model.audio_encoder.conv2, tensor)
-        return
-    if key == "audio_tower.conv2.bias":
-        model.audio_encoder.conv2.bias = tensor.clone()
-        return
-    if key == "audio_tower.embed_positions.weight":
-        model.audio_encoder.embed_positions = tensor.clone()
-        return
-    if key == "audio_tower.norm.weight":
-        model.audio_encoder.layer_norm.weight = tensor.clone()
-        return
-    if key == "audio_tower.norm.bias":
-        model.audio_encoder.layer_norm.bias = tensor.clone()
-        return
-
-    # Audio encoder layers
-    if key.startswith("audio_tower.layers."):
-        parts = key.split(".")
-        layer_idx = int(parts[2])
-        layer = model.audio_encoder.layers[layer_idx]
-        rest = ".".join(parts[3:])
-
-        if rest == "input_layernorm.weight":
-            layer.self_attn_layer_norm.weight = tensor.clone()
-        elif rest == "input_layernorm.bias":
-            layer.self_attn_layer_norm.bias = tensor.clone()
-        elif rest == "self_attn.q_proj.weight":
-            layer.q_proj.weight = tensor.clone()
-        elif rest == "self_attn.q_proj.bias":
-            layer.q_proj.bias_param = tensor.clone()
-        elif rest == "self_attn.k_proj.weight":
-            layer.k_proj.weight = tensor.clone()
-        elif rest == "self_attn.k_proj.bias":
-            layer.k_proj.bias_param = tensor.clone()
-        elif rest == "self_attn.v_proj.weight":
-            layer.v_proj.weight = tensor.clone()
-        elif rest == "self_attn.v_proj.bias":
-            layer.v_proj.bias_param = tensor.clone()
-        elif rest == "self_attn.o_proj.weight":
-            layer.out_proj.weight = tensor.clone()
-        elif rest == "self_attn.o_proj.bias":
-            layer.out_proj.bias_param = tensor.clone()
-        elif rest == "post_attention_layernorm.weight":
-            layer.final_layer_norm.weight = tensor.clone()
-        elif rest == "post_attention_layernorm.bias":
-            layer.final_layer_norm.bias = tensor.clone()
-        elif rest == "mlp.fc1.weight":
-            layer.fc1.weight = tensor.clone()
-        elif rest == "mlp.fc1.bias":
-            layer.fc1.bias_param = tensor.clone()
-        elif rest == "mlp.fc2.weight":
-            layer.fc2.weight = tensor.clone()
-        elif rest == "mlp.fc2.bias":
-            layer.fc2.bias_param = tensor.clone()
-        return
-
-    # --- Multi-modal projector ---
-    if key == "multi_modal_projector.linear_1.weight":
-        model.multi_modal_projector.linear_1.weight = tensor.clone()
-        return
-    if key == "multi_modal_projector.linear_1.bias":
-        model.multi_modal_projector.linear_1.bias_param = tensor.clone()
-        return
-    if key == "multi_modal_projector.linear_2.weight":
-        model.multi_modal_projector.linear_2.weight = tensor.clone()
-        return
-    if key == "multi_modal_projector.linear_2.bias":
-        model.multi_modal_projector.linear_2.bias_param = tensor.clone()
-        return
-
-    # --- Text decoder ---
-    if key == "language_model.model.embed_tokens.weight":
-        model.text_decoder.embed_tokens.weight = tensor.clone()
-        return
-    if key == "language_model.model.norm.weight":
-        model.text_decoder.norm.weight = tensor.clone()
-        return
-    if key == "language_model.lm_head.weight":
-        model.lm_head.weight = tensor.clone()
-        return
-
-    # Text decoder layers
-    if key.startswith("language_model.model.layers."):
-        parts = key.split(".")
-        layer_idx = int(parts[3])
-        layer = model.text_decoder.layers[layer_idx]
-        rest = ".".join(parts[4:])
-
-        if rest == "input_layernorm.weight":
-            layer.input_layernorm.weight = tensor.clone()
-        elif rest == "self_attn.q_proj.weight":
-            layer.q_proj.weight = tensor.clone()
-        elif rest == "self_attn.k_proj.weight":
-            layer.k_proj.weight = tensor.clone()
-        elif rest == "self_attn.v_proj.weight":
-            layer.v_proj.weight = tensor.clone()
-        elif rest == "self_attn.o_proj.weight":
-            layer.o_proj.weight = tensor.clone()
-        elif rest == "post_attention_layernorm.weight":
-            layer.post_attention_layernorm.weight = tensor.clone()
-        elif rest == "mlp.gate_proj.weight":
-            layer.mlp.gate_proj.weight = tensor.clone()
-        elif rest == "mlp.up_proj.weight":
-            layer.mlp.up_proj.weight = tensor.clone()
-        elif rest == "mlp.down_proj.weight":
-            layer.mlp.down_proj.weight = tensor.clone()
-        return
-
-
 def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     """
     Load GLM-ASR model from HuggingFace and create Triton version.
-
-    Uses memory-efficient shard-by-shard loading from safetensors files
-    instead of materializing the full HuggingFace model in RAM.
     """
-    from transformers import AutoProcessor, AutoConfig
+    from transformers import AutoProcessor, GlmAsrForConditionalGeneration, AutoConfig
     from model import GlmAsrModel
 
     print(f"Loading HuggingFace model: {model_name}")
@@ -434,27 +267,18 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     triton_model = GlmAsrModel(triton_config)
 
-    # Memory-efficient: download safetensors to cache, load shard-by-shard
     print("Loading HuggingFace weights...")
-    try:
-        from huggingface_hub import snapshot_download
-        model_dir = snapshot_download(
-            model_name,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
-        )
-        _load_weights_from_safetensors(triton_model, model_dir)
-    except (ImportError, Exception) as e:
-        # Fallback: load full HF model (uses more RAM)
-        print(f"Safetensors loading failed ({e}), falling back to full model load...")
-        from transformers import GlmAsrForConditionalGeneration
-        hf_model = GlmAsrForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=torch.float32, device_map="cpu"
-        )
-        load_weights_from_hf_model(triton_model, hf_model)
-        del hf_model
-        import gc
-        gc.collect()
+    hf_model = GlmAsrForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=torch.float32, device_map="cpu"
+    )
 
     processor = AutoProcessor.from_pretrained(model_name)
+
+    load_weights_from_hf_model(triton_model, hf_model)
+
+    del hf_model
+    import gc
+
+    gc.collect()
 
     return triton_model, processor
