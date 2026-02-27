@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+temp_clone/
+.DS_Store
+*.egg-info/
